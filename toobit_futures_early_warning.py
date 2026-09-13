@@ -2,36 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 ربات هشدار زودهنگام پامپ/دامپ - بازار فیوچرز توبیت (Toobit)
--------------------------------------------------------------
-مهم: هیچ ربات یا الگوریتمی نمی‌تونه با قطعیت پامپ/دامپ رو *قبل* از وقوع
-پیش‌بینی کنه. این اسکریپت دنبال نشانه‌های مقدماتی می‌گرده که آماری/تجربی
-اغلب *قبل* از حرکت شدید قیمت ظاهر می‌شن، و بر اساس اونا یه "هشدار احتمالی"
-می‌ده - نه یه سیگنال تضمینی خرید/فروش.
-
-منطق کار (دو مرحله‌ای، برای مدیریت محدودیت نرخ درخواست API):
-
-  مرحله ۱ - اسکن سبک کل بازار (هر پول یک درخواست bulk):
-      - قیمت و حجم معاملات ۲۴ساعته همه‌ی نمادهای فیوچرز
-      - نرخ فاندینگ همه‌ی نمادها
-      نمادی که هنوز قیمتش خیلی حرکت نکرده (PRICE_MOVE_CAP) ولی حجم یا
-      فاندینگش داره غیرعادی جهش می‌کنه => "نامزد" مرحله ۲ می‌شه.
-
-  مرحله ۲ - تأیید روی نامزدها (چند درخواست per-symbol، فقط برای نامزدها):
-      - عدم تعادل Order Book (فشار خرید/فروش در عمق بازار)
-      - تغییر Open Interest (پوزیشن‌های باز)
-      این‌ها رو با هم ترکیب می‌کنه و اگه امتیاز کافی بود، هشدار زودهنگام
-      می‌فرسته.
-
-      یه هشدار "تأییدشده" هم جدا وجود داره: وقتی قیمت واقعاً شروع به
-      حرکت شدید می‌کنه (یعنی پامپ/دامپ همین الان داره اتفاق می‌افته).
-
-نحوه‌ی اجرا:
-    pip install requests
-    export TELEGRAM_BOT_TOKEN="توکن ربات"
-    export TELEGRAM_CHAT_ID="چت‌آیدی"
-    python toobit_futures_early_warning.py
-
-تنظیمات قابل تغییر در بخش CONFIG پایین هستن.
 """
 
 import os
@@ -44,51 +14,34 @@ from datetime import datetime
 
 BASE_URL = "https://api.toobit.com"
 
-TICKER_ENDPOINT = "/quote/v1/contract/ticker/24hr"       # bulk - قیمت/حجم همه نمادها
-FUNDING_ENDPOINT = "/api/v1/futures/fundingRate"          # bulk - فاندینگ همه نمادها
-DEPTH_ENDPOINT = "/quote/v1/depth"                        # per-symbol - عمق بازار
-OPEN_INTEREST_ENDPOINT = "/quote/v1/openInterest"         # per-symbol - پوزیشن باز
+TICKER_ENDPOINT = "/quote/v1/contract/ticker/24hr"
+FUNDING_ENDPOINT = "/api/v1/futures/fundingRate"
+DEPTH_ENDPOINT = "/quote/v1/depth"
+OPEN_INTEREST_ENDPOINT = "/quote/v1/openInterest"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEND_TO_TELEGRAM = True
 
-# هر چند ثانیه یک‌بار مرحله ۱ (اسکن سبک کل بازار) اجرا بشه
 POLL_INTERVAL_SECONDS = 20
+WINDOW_SIZE = 8
 
-# چند تا نمونه‌ی اخیر برای هر نماد نگه داره (پنجره‌ی بررسی روند)
-WINDOW_SIZE = 8  # با POLL=20s یعنی پنجره حدود ~2.5 دقیقه
-
-# --- آستانه‌های مرحله ۱ (شناسایی نامزد) ---
-# نسبت جهش حجم معاملات نسبت به میانگین دلتاهای قبلی، برای اینکه "نامزد" بشه
 EARLY_VOLUME_RATIO = 2.2
-# حداکثر درصد تغییر قیمتی که تا الان مجازه (اگه بیشتر شده، یعنی دیگه دیر شده و این پیش‌بینی نیست)
 PRICE_MOVE_CAP_PCT = 2.5
-# حداقل حجم quote-volume 24h که یه نماد اصلا بررسی بشه (فیلتر نمادهای بی‌رمق)
 MIN_QUOTE_VOLUME = 50000
-# حداکثر تعداد نامزد در هر دور که وارد مرحله ۲ (بررسی سنگین‌تر) بشن
 MAX_CANDIDATES_PER_CYCLE = 15
 
-# --- آستانه‌های مرحله ۲ (تأیید) ---
-# عدم تعادل عمق بازار: نسبت حجم سفارش خرید به فروش در N سطح برتر
 ORDERBOOK_DEPTH_LEVELS = 20
-ORDERBOOK_IMBALANCE_THRESHOLD = 1.8  # یعنی یک طرف حداقل 1.8 برابر طرف مقابل
-# نسبت تغییر Open Interest نسبت به مقدار قبلی برای تایید فشار پوزیشن‌گیری
-OI_CHANGE_RATIO_THRESHOLD = 1.15  # یعنی افزایش/کاهش حداقل 15%
+ORDERBOOK_IMBALANCE_THRESHOLD = 1.8
+OI_CHANGE_RATIO_THRESHOLD = 1.15
 
-# آستانه‌ی امتیاز ترکیبی نهایی برای ارسال "هشدار زودهنگام" (هر شرط تاییدشده 1 امتیاز)
-EARLY_WARNING_MIN_SCORE = 2  # از سه شرط: orderbook imbalance, OI change, funding anomaly
+EARLY_WARNING_MIN_SCORE = 2
 
-# --- آستانه‌ی هشدار "تأییدشده" (پامپ/دامپ همین الان در حال وقوع است) ---
 CONFIRMED_PRICE_CHANGE_PCT = 6.0
 CONFIRMED_VOLUME_RATIO = 3.0
 
-# کول‌داون هشدار برای هر نماد (ثانیه) تا اسپم نشه
 ALERT_COOLDOWN_SECONDS = 15 * 60
 
-# اگه بخوای اسکریپت بعد از مدت مشخصی خودش (تمیز) خاموش بشه (مثلا برای اجرا
-# روی GitHub Actions که هر job سقف زمانی داره)، این رو با متغیر محیطی
-# MAX_RUNTIME_SECONDS ست کن. مقدار 0 یعنی بدون محدودیت (اجرای همیشگی).
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "0"))
 
 # ======================================================================
@@ -126,7 +79,6 @@ class SymbolState:
         return last_delta / avg_prior
 
     def funding_rate_jump(self):
-        """تغییر ناگهانی نرخ فاندینگ نسبت به مقدار قبلی، به عنوان نشونه فشار جهت‌دار"""
         if len(self.funding_rates) < 2:
             return 0.0
         return abs(self.funding_rates[-1] - self.funding_rates[-2])
@@ -143,17 +95,19 @@ def send_telegram_message(text):
     if not SEND_TO_TELEGRAM:
         return
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️  توکن/چت‌آیدی تلگرام ست نشده؛ پیام ارسال نشد.")
+        print("توکن/چت‌آیدی تلگرام ست نشده؛ پیام ارسال نشد.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         resp = requests.post(
-            url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=10
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "Markdown"},
+            timeout=10,
         )
         if resp.status_code != 200:
-            print(f"⚠️  ارسال تلگرام ناموفق: {resp.status_code} {resp.text}")
+            print(f"ارسال تلگرام ناموفق: {resp.status_code} {resp.text}")
     except Exception as e:
-        print(f"⚠️  خطای ارسال تلگرام: {e}")
+        print(f"خطای ارسال تلگرام: {e}")
 
 
 def fetch_bulk_tickers():
@@ -165,7 +119,6 @@ def fetch_bulk_funding_rates():
 
 
 def fetch_orderbook_imbalance(symbol):
-    """نسبت حجم سفارش خرید به فروش در N سطح برتر. >1 یعنی فشار خرید، <1 یعنی فشار فروش."""
     try:
         data = http_get(DEPTH_ENDPOINT, {"symbol": symbol, "limit": ORDERBOOK_DEPTH_LEVELS})
         bid_qty = sum(float(level[1]) for level in data.get("b", []))
@@ -188,21 +141,27 @@ def fetch_open_interest(symbol):
     return None
 
 
+def display_symbol(symbol):
+    return symbol.replace("-SWAP-", "").replace("-SWAP", "")
+
+
 def format_early_warning(symbol, price_change, vol_ratio, ob_imbalance, oi_ratio, funding_jump):
     now = datetime.now().strftime("%H:%M:%S")
     direction_hint = "خرید (احتمال پامپ)" if (ob_imbalance or 1) >= 1 else "فروش (احتمال دامپ)"
     lines = [
-        f"[{now}] ⚠️ هشدار زودهنگام | {symbol}",
-        f"   این یه سیگنال احتمالی «قبل از حرکت شدید» است، نه تضمینی.",
-        f"   تغییر قیمت تا الان: {price_change:+.2f}% (هنوز کم)",
-        f"   جهش حجم معاملات: {vol_ratio:.1f}x میانگین",
+        f"🪙 *{display_symbol(symbol)}*",
+        f"⚠️ هشدار زودهنگام | {now}",
+        f"",
+        f"این یه سیگنال احتمالی «قبل از حرکت شدید» است، نه تضمینی.",
+        f"تغییر قیمت تا الان: {price_change:+.2f}% (هنوز کم)",
+        f"جهش حجم معاملات: {vol_ratio:.1f}x میانگین",
     ]
     if ob_imbalance is not None:
-        lines.append(f"   عدم تعادل Order Book: {ob_imbalance:.2f} → فشار سمت {direction_hint}")
+        lines.append(f"عدم تعادل Order Book: {ob_imbalance:.2f} → فشار سمت {direction_hint}")
     if oi_ratio is not None:
-        lines.append(f"   تغییر Open Interest: {oi_ratio:.2f}x")
+        lines.append(f"تغییر Open Interest: {oi_ratio:.2f}x")
     if funding_jump:
-        lines.append(f"   جهش نرخ فاندینگ: {funding_jump:.5f}")
+        lines.append(f"جهش نرخ فاندینگ: {funding_jump:.5f}")
     return "\n".join(lines)
 
 
@@ -210,17 +169,18 @@ def format_confirmed_alert(symbol, direction, price_change, vol_ratio, price):
     now = datetime.now().strftime("%H:%M:%S")
     arrow = "🚀 پامپ در حال وقوع" if direction == "pump" else "🔻 دامپ در حال وقوع"
     return (
-        f"[{now}] {arrow} | {symbol}\n"
-        f"   تغییر قیمت: {price_change:+.2f}%\n"
-        f"   نسبت جهش حجم: {vol_ratio:.1f}x میانگین\n"
-        f"   آخرین قیمت: {price}"
+        f"🪙 *{display_symbol(symbol)}*\n"
+        f"{arrow} | {now}\n\n"
+        f"تغییر قیمت: {price_change:+.2f}%\n"
+        f"نسبت جهش حجم: {vol_ratio:.1f}x میانگین\n"
+        f"آخرین قیمت: {price}"
     )
 
 
 def main():
     print("شروع رصد فیوچرز توبیت برای نشانه‌های زودهنگام پامپ/دامپ ...")
     print(f"مرحله ۱ هر {POLL_INTERVAL_SECONDS} ثانیه | پنجره: {WINDOW_SIZE} نمونه")
-    tg_status = "فعال ✅" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "غیرفعال ⚠️"
+    tg_status = "فعال" if (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID) else "غیرفعال"
     print(f"ارسال به تلگرام: {tg_status}\n")
 
     states = {}
@@ -228,7 +188,7 @@ def main():
 
     while True:
         if MAX_RUNTIME_SECONDS and (time.time() - start_ts) >= MAX_RUNTIME_SECONDS:
-            print("⏹️  به سقف زمانی تنظیم‌شده رسیدیم؛ خروج تمیز (اجرای بعدی طبق زمان‌بندی شروع می‌شه).")
+            print("به سقف زمانی تنظیم‌شده رسیدیم؛ خروج تمیز.")
             break
 
         try:
@@ -248,10 +208,8 @@ def main():
         now_ts = time.time()
         candidates = []
 
-        # ---------- مرحله ۱: اسکن سبک ----------
         for item in tickers:
             symbol = item.get("s", "")
-            # فقط قراردادهای دائمی خطی USDT (مثل BTC-SWAP-USDT)
             if "-SWAP-" not in symbol or not symbol.endswith("USDT"):
                 continue
 
@@ -277,7 +235,6 @@ def main():
             vol_ratio = state.volume_accel_ratio()
             funding_jump = state.funding_rate_jump()
 
-            # --- هشدار تأییدشده: حرکت بزرگ همین الان در حال وقوعه ---
             if abs(price_change) >= CONFIRMED_PRICE_CHANGE_PCT and vol_ratio >= CONFIRMED_VOLUME_RATIO:
                 if now_ts - state.last_confirmed_alert >= ALERT_COOLDOWN_SECONDS:
                     direction = "pump" if price_change > 0 else "dump"
@@ -285,17 +242,14 @@ def main():
                     print(text + "\n" + "-" * 50)
                     send_telegram_message(text)
                     state.last_confirmed_alert = now_ts
-                continue  # اگه تأیید شد دیگه نیازی به early warning نیست
+                continue
 
-            # --- نامزد مرحله ۲: هنوز قیمت خیلی حرکت نکرده ولی حجم/فاندینگ داره جهش می‌کنه ---
             if abs(price_change) <= PRICE_MOVE_CAP_PCT and vol_ratio >= EARLY_VOLUME_RATIO:
                 if now_ts - state.last_early_alert >= ALERT_COOLDOWN_SECONDS:
                     candidates.append((symbol, price, price_change, vol_ratio, funding_jump))
 
-        # محدود کردن تعداد نامزدها برای کنترل تعداد درخواست‌های per-symbol
         candidates = candidates[:MAX_CANDIDATES_PER_CYCLE]
 
-        # ---------- مرحله ۲: تأیید روی نامزدها ----------
         for symbol, price, price_change, vol_ratio, funding_jump in candidates:
             state = states[symbol]
 
