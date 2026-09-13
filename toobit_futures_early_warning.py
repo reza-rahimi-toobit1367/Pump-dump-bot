@@ -18,29 +18,40 @@ TICKER_ENDPOINT = "/quote/v1/contract/ticker/24hr"
 FUNDING_ENDPOINT = "/api/v1/futures/fundingRate"
 DEPTH_ENDPOINT = "/quote/v1/depth"
 OPEN_INTEREST_ENDPOINT = "/quote/v1/openInterest"
+KLINES_ENDPOINT = "/quote/v1/klines"
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SEND_TO_TELEGRAM = True
 
 POLL_INTERVAL_SECONDS = 20
-WINDOW_SIZE = 8
+WINDOW_SIZE = 12
 
-EARLY_VOLUME_RATIO = 2.2
-PRICE_MOVE_CAP_PCT = 2.5
-MIN_QUOTE_VOLUME = 50000
+EARLY_VOLUME_RATIO = 2.5
+PRICE_MOVE_CAP_PCT = 2.0
+MIN_QUOTE_VOLUME = 150000
 MAX_CANDIDATES_PER_CYCLE = 15
+MIN_VOLUME_TREND_CONSISTENCY = 0.6
 
 ORDERBOOK_DEPTH_LEVELS = 20
-ORDERBOOK_IMBALANCE_THRESHOLD = 1.8
-OI_CHANGE_RATIO_THRESHOLD = 1.15
+ORDERBOOK_IMBALANCE_THRESHOLD = 2.2
+OI_CHANGE_RATIO_THRESHOLD = 1.20
+MIN_FUNDING_JUMP = 0.0015
 
-EARLY_WARNING_MIN_SCORE = 2
+RSI_INTERVAL = "15m"
+RSI_PERIOD = 14
+RSI_LONG_MAX = 68
+RSI_SHORT_MIN = 32
+
+EARLY_WARNING_MIN_SCORE = 4
 
 CONFIRMED_PRICE_CHANGE_PCT = 6.0
 CONFIRMED_VOLUME_RATIO = 3.0
 
-ALERT_COOLDOWN_SECONDS = 15 * 60
+ALERT_COOLDOWN_SECONDS = 20 * 60
+
+STOP_LOSS_PCT = 10.0
+TAKE_PROFIT_PCT = 10.0
 
 MAX_RUNTIME_SECONDS = int(os.environ.get("MAX_RUNTIME_SECONDS", "0"))
 
@@ -77,6 +88,16 @@ class SymbolState:
         if avg_prior <= 0:
             return 0.0
         return last_delta / avg_prior
+
+    def volume_trend_consistency(self):
+        if len(self.quote_volumes) < 3:
+            return 0.0
+        deltas = [
+            self.quote_volumes[i] - self.quote_volumes[i - 1]
+            for i in range(1, len(self.quote_volumes))
+        ]
+        positive = sum(1 for d in deltas if d > 0)
+        return positive / len(deltas)
 
     def funding_rate_jump(self):
         if len(self.funding_rates) < 2:
@@ -141,18 +162,79 @@ def fetch_open_interest(symbol):
     return None
 
 
+def calculate_rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def fetch_rsi(symbol):
+    try:
+        data = http_get(
+            KLINES_ENDPOINT,
+            {"symbol": symbol, "interval": RSI_INTERVAL, "limit": RSI_PERIOD + 50},
+        )
+        closes = [float(candle[4]) for candle in data]
+        if len(closes) < RSI_PERIOD + 1:
+            return None
+        return calculate_rsi(closes, RSI_PERIOD)
+    except Exception:
+        return None
+
+
 def display_symbol(symbol):
     return symbol.replace("-SWAP-", "").replace("-SWAP", "")
 
 
-def format_early_warning(symbol, price_change, vol_ratio, ob_imbalance, oi_ratio, funding_jump):
+def calc_trade_levels(entry_price, is_long):
+    if is_long:
+        stop = entry_price * (1 - STOP_LOSS_PCT / 100)
+        target = entry_price * (1 + TAKE_PROFIT_PCT / 100)
+    else:
+        stop = entry_price * (1 + STOP_LOSS_PCT / 100)
+        target = entry_price * (1 - TAKE_PROFIT_PCT / 100)
+    return stop, target
+
+
+def format_price(p):
+    if p >= 100:
+        return f"{p:,.2f}"
+    elif p >= 1:
+        return f"{p:,.4f}"
+    else:
+        return f"{p:.6f}"
+
+
+def format_early_warning(symbol, price, price_change, vol_ratio, ob_imbalance, oi_ratio, funding_jump, rsi):
     now = datetime.now().strftime("%H:%M:%S")
-    direction_hint = "خرید (احتمال پامپ)" if (ob_imbalance or 1) >= 1 else "فروش (احتمال دامپ)"
+    is_long = (ob_imbalance or 1) >= 1
+    direction_hint = "خرید (احتمال پامپ)" if is_long else "فروش (احتمال دامپ)"
+    position_word = "🟢 لانگ (Long)" if is_long else "🔴 شورت (Short)"
+    stop, target = calc_trade_levels(price, is_long)
+
     lines = [
         f"🪙 *{display_symbol(symbol)}*",
         f"⚠️ هشدار زودهنگام | {now}",
         f"",
-        f"این یه سیگنال احتمالی «قبل از حرکت شدید» است، نه تضمینی.",
+        f"این یه سیگنال احتمالی «قبل از حرکت شدید» است، نه تضمینی و نه توصیه‌ی مالی.",
         f"تغییر قیمت تا الان: {price_change:+.2f}% (هنوز کم)",
         f"جهش حجم معاملات: {vol_ratio:.1f}x میانگین",
     ]
@@ -162,18 +244,37 @@ def format_early_warning(symbol, price_change, vol_ratio, ob_imbalance, oi_ratio
         lines.append(f"تغییر Open Interest: {oi_ratio:.2f}x")
     if funding_jump:
         lines.append(f"جهش نرخ فاندینگ: {funding_jump:.5f}")
+    if rsi is not None:
+        lines.append(f"RSI ({RSI_INTERVAL}): {rsi:.1f}")
+
+    lines += [
+        f"",
+        f"پیشنهاد جهت: {position_word}",
+        f"نقطه ورود: {format_price(price)}",
+        f"تارگت: {format_price(target)}",
+        f"حد ضرر: {format_price(stop)}",
+    ]
     return "\n".join(lines)
 
 
-def format_confirmed_alert(symbol, direction, price_change, vol_ratio, price):
+def format_confirmed_alert(symbol, direction, price_change, vol_ratio, price, rsi=None):
     now = datetime.now().strftime("%H:%M:%S")
-    arrow = "🚀 پامپ در حال وقوع" if direction == "pump" else "🔻 دامپ در حال وقوع"
+    is_long = direction == "pump"
+    arrow = "🚀 پامپ در حال وقوع" if is_long else "🔻 دامپ در حال وقوع"
+    position_word = "🟢 لانگ (Long)" if is_long else "🔴 شورت (Short)"
+    stop, target = calc_trade_levels(price, is_long)
+    rsi_line = f"RSI ({RSI_INTERVAL}): {rsi:.1f}\n" if rsi is not None else ""
     return (
         f"🪙 *{display_symbol(symbol)}*\n"
         f"{arrow} | {now}\n\n"
         f"تغییر قیمت: {price_change:+.2f}%\n"
         f"نسبت جهش حجم: {vol_ratio:.1f}x میانگین\n"
-        f"آخرین قیمت: {price}"
+        f"{rsi_line}"
+        f"\n"
+        f"پیشنهاد جهت: {position_word}\n"
+        f"نقطه ورود: {format_price(price)}\n"
+        f"تارگت: {format_price(target)}\n"
+        f"حد ضرر: {format_price(stop)}"
     )
 
 
@@ -234,17 +335,23 @@ def main():
             price_change = state.price_change_pct()
             vol_ratio = state.volume_accel_ratio()
             funding_jump = state.funding_rate_jump()
+            vol_consistency = state.volume_trend_consistency()
 
             if abs(price_change) >= CONFIRMED_PRICE_CHANGE_PCT and vol_ratio >= CONFIRMED_VOLUME_RATIO:
                 if now_ts - state.last_confirmed_alert >= ALERT_COOLDOWN_SECONDS:
                     direction = "pump" if price_change > 0 else "dump"
-                    text = format_confirmed_alert(symbol, direction, price_change, vol_ratio, price)
+                    rsi_confirmed = fetch_rsi(symbol)
+                    text = format_confirmed_alert(symbol, direction, price_change, vol_ratio, price, rsi_confirmed)
                     print(text + "\n" + "-" * 50)
                     send_telegram_message(text)
                     state.last_confirmed_alert = now_ts
                 continue
 
-            if abs(price_change) <= PRICE_MOVE_CAP_PCT and vol_ratio >= EARLY_VOLUME_RATIO:
+            if (
+                abs(price_change) <= PRICE_MOVE_CAP_PCT
+                and vol_ratio >= EARLY_VOLUME_RATIO
+                and vol_consistency >= MIN_VOLUME_TREND_CONSISTENCY
+            ):
                 if now_ts - state.last_early_alert >= ALERT_COOLDOWN_SECONDS:
                     candidates.append((symbol, price, price_change, vol_ratio, funding_jump))
 
@@ -256,10 +363,15 @@ def main():
             ob_imbalance = fetch_orderbook_imbalance(symbol)
             oi_now = fetch_open_interest(symbol)
             oi_ratio = None
+            oi_delta = None
             if oi_now is not None:
                 state.open_interest_history.append(oi_now)
                 if len(state.open_interest_history) >= 2 and state.open_interest_history[0] > 0:
                     oi_ratio = state.open_interest_history[-1] / state.open_interest_history[0]
+                    oi_delta = state.open_interest_history[-1] - state.open_interest_history[0]
+
+            is_long_bias = (ob_imbalance or 1) >= 1
+            rsi = fetch_rsi(symbol)
 
             score = 0
             if ob_imbalance is not None and (
@@ -267,16 +379,24 @@ def main():
                 or ob_imbalance <= 1 / ORDERBOOK_IMBALANCE_THRESHOLD
             ):
                 score += 1
-            if oi_ratio is not None and (
-                oi_ratio >= OI_CHANGE_RATIO_THRESHOLD or oi_ratio <= 1 / OI_CHANGE_RATIO_THRESHOLD
-            ):
+            if oi_ratio is not None and oi_delta is not None:
+                oi_significant = (
+                    oi_ratio >= OI_CHANGE_RATIO_THRESHOLD or oi_ratio <= 1 / OI_CHANGE_RATIO_THRESHOLD
+                )
+                oi_direction_aligned = (oi_delta > 0) == is_long_bias
+                if oi_significant and oi_direction_aligned:
+                    score += 1
+            if funding_jump and funding_jump >= MIN_FUNDING_JUMP:
                 score += 1
-            if funding_jump and funding_jump >= 0.001:
-                score += 1
+            if rsi is not None:
+                if is_long_bias and rsi <= RSI_LONG_MAX:
+                    score += 1
+                elif not is_long_bias and rsi >= RSI_SHORT_MIN:
+                    score += 1
 
             if score >= EARLY_WARNING_MIN_SCORE:
                 text = format_early_warning(
-                    symbol, price_change, vol_ratio, ob_imbalance, oi_ratio, funding_jump
+                    symbol, price, price_change, vol_ratio, ob_imbalance, oi_ratio, funding_jump, rsi
                 )
                 print(text + "\n" + "-" * 50)
                 send_telegram_message(text)
